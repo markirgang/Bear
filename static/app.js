@@ -1,0 +1,853 @@
+/**
+ * Main orchestrator for the Gemmy AI Dancing Bear stage.
+ * Connects the L298N motor controls, spotlight servos, stage servo,
+ * 3D renderer, Gemini voice assistant and music sync engine.
+ */
+
+document.addEventListener('DOMContentLoaded', () => {
+    let renderer = null;
+    try {
+        renderer = new Bear3DRenderer('viewport3d');
+    } catch (err) {
+        console.warn('3D renderer unavailable:', err);
+        const host = document.getElementById('viewport3d');
+        if (host) {
+            host.innerHTML = '<div style="display:flex;height:100%;align-items:center;justify-content:center;color:var(--text-muted);font-size:0.85rem;text-align:center;padding:20px;">3D preview unavailable (WebGL required).<br>All hardware controls still work.</div>';
+        }
+    }
+
+    const bearState = {
+        mode: 'idle',
+        automation: true,
+        mouth_channel1: 'off',
+        body_channel2: 'off',
+        tushie: false,
+        spotlight: { pan: 90, tilt: 90, intensity: 0, mode: 'idle' },
+        stage: { angle: 90, mode: 'idle' },
+        beat_energy: 0,
+        hardware_available: false,
+    };
+
+    let speakerVolume = 100;
+    let volumeSaveTimer = null;
+
+    function postJSON(url, payload) {
+        return fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload || {})
+        }).then((res) => res.json()).catch(() => ({}));
+    }
+
+    const appAPI = {
+        getState: () => bearState,
+
+        setMode: (mode) => {
+            bearState.mode = mode;
+            if (mode === 'dancing') bearState.body_channel2 = 'left';
+            refreshModeUI();
+            return postJSON('/api/bear/mode', { mode }).then((data) => {
+                if (data.state) applyServerState(data.state);
+                return data;
+            });
+        },
+
+        setMusicPerformanceActive: (active) => {
+            appAPI.setMode(active ? 'dancing' : 'idle');
+        },
+
+        setTalkActive: (active) => {
+            appAPI.setMode(active ? 'talking' : 'idle');
+        },
+
+        setMouthEnergized: (energized) => {
+            const mode = energized ? 'open' : 'off';
+            if (bearState.mouth_channel1 === mode) return;
+            bearState.mouth_channel1 = mode;
+            updateMouthUI();
+            postJSON('/api/bear/control', { mouth: mode });
+        },
+
+        setMouthMode: (mode) => {
+            bearState.mouth_channel1 = mode;
+            updateMouthUI();
+            postJSON('/api/bear/control', { mouth: mode });
+        },
+
+        setBody: (direction) => {
+            const value = ['left', 'right'].includes(direction) ? direction : 'off';
+            bearState.body_channel2 = value;
+            updateBodyUI();
+            postJSON('/api/bear/control', { body: value });
+        },
+
+        setTushie: (active) => {
+            bearState.tushie = !!active;
+            updateTushieUI();
+            postJSON('/api/bear/control', { tushie: !!active });
+        },
+
+        pulseTushie: (seconds) => {
+            bearState.tushie = true;
+            updateTushieUI();
+            postJSON('/api/bear/control', { tushie_pulse: seconds || 0.9 });
+        },
+
+        setSpotlight: (opts) => {
+            const payload = Object.assign({}, opts);
+            if (opts.manual) payload.manual = true;
+            return postJSON('/api/bear/spotlight', payload).then((data) => {
+                if (data.state) applyServerState(data.state);
+                return data;
+            });
+        },
+
+        setStage: (opts) => {
+            const payload = Object.assign({}, opts);
+            if (opts.manual) payload.manual = true;
+            return postJSON('/api/bear/stage', payload).then((data) => {
+                if (data.state) applyServerState(data.state);
+                return data;
+            });
+        },
+
+        setAutomation: (enabled) => {
+            bearState.automation = !!enabled;
+            refreshModeUI();
+            return postJSON('/api/bear/control', { automation: !!enabled });
+        },
+
+        setVolume: (value) => {
+            speakerVolume = Math.max(0, Math.min(100, parseInt(value, 10) || 0));
+            const player = document.getElementById('danceAudioPlayer');
+            if (player) player.volume = speakerVolume / 100;
+            const valEl = document.getElementById('valVolumeText');
+            if (valEl) valEl.textContent = speakerVolume + '%';
+            const settingsSlider = document.getElementById('slideSpeakerVolSettings');
+            if (settingsSlider) settingsSlider.value = speakerVolume;
+            const settingsVal = document.getElementById('valSpeakerVolSettings');
+            if (settingsVal) settingsVal.textContent = speakerVolume + '%';
+
+            clearTimeout(volumeSaveTimer);
+            volumeSaveTimer = setTimeout(() => {
+                postJSON('/api/hardware/config', { speaker_volume: speakerVolume });
+            }, 400);
+        }
+    };
+
+    window.BearApp = appAPI;
+
+    const geminiController = new GeminiAIController(appAPI);
+    const performanceEngine = new BearPerformanceEngine(appAPI);
+
+    setupTopNavTabs();
+    setupRightPanelTabs();
+    setupMotorControls(appAPI);
+    setupSpotlightStageControls(appAPI);
+    setupPresets(appAPI);
+    setupCamera(appAPI);
+    setupProfileSettings(appAPI, geminiController);
+    setupHardwareSettings(appAPI);
+    setupExport();
+
+    requestAnimationFrame(animate);
+
+    function animate() {
+        requestAnimationFrame(animate);
+        if (renderer && renderer.updatePose) {
+            renderer.updatePose(null, bearState);
+            renderer.render();
+        }
+    }
+
+    function refreshModeUI() {
+        const modeEl = document.getElementById('statusMode');
+        if (modeEl) modeEl.textContent = bearState.mode.toUpperCase();
+        const autoEl = document.getElementById('statusAutomation');
+        if (autoEl) {
+            autoEl.textContent = bearState.automation ? 'ON' : 'MANUAL';
+            autoEl.style.color = bearState.automation ? 'var(--accent-green)' : 'var(--accent-orange)';
+        }
+        const toggle = document.getElementById('toggleAutomation');
+        if (toggle) toggle.checked = bearState.automation;
+    }
+
+    function updateMouthUI() {
+        const el = document.getElementById('statusMouth');
+        if (!el) return;
+        if (bearState.mouth_channel1 === 'open') {
+            el.textContent = 'OPEN (FORWARD)';
+            el.style.color = 'var(--accent-green)';
+        } else {
+            el.textContent = 'CLOSED';
+            el.style.color = 'var(--text-muted)';
+        }
+    }
+
+    function updateBodyUI() {
+        const el = document.getElementById('statusBody');
+        if (!el) return;
+        const direction = bearState.body_channel2;
+        if (direction === 'left' || direction === 'right') {
+            el.textContent = 'SHIMMY ' + direction.toUpperCase();
+            el.style.color = 'var(--accent-orange)';
+        } else {
+            el.textContent = 'STILL';
+            el.style.color = 'var(--text-muted)';
+        }
+    }
+
+    function updateTushieUI() {
+        const el = document.getElementById('statusTushie');
+        if (!el) return;
+        if (bearState.tushie) {
+            el.textContent = 'PUSHED OUT';
+            el.style.color = 'var(--accent-purple)';
+        } else {
+            el.textContent = 'RETRACTED';
+            el.style.color = 'var(--text-muted)';
+        }
+    }
+
+    function setSliderValue(id, value, suffix) {
+        const slider = document.getElementById(id);
+        if (slider && document.activeElement !== slider) slider.value = value;
+        const map = {
+            slideSpotPan: 'valSpotPan',
+            slideSpotTilt: 'valSpotTilt',
+            slideSpotIntensity: 'valSpotIntensity',
+            slideStageAngle: 'valStageAngle'
+        };
+        const label = document.getElementById(map[id]);
+        if (label) label.textContent = Math.round(value) + (suffix || '');
+    }
+
+    function applyServerState(state) {
+        if (!state) return;
+        Object.assign(bearState, state);
+        if (state.spotlight) bearState.spotlight = state.spotlight;
+        if (state.stage) bearState.stage = state.stage;
+
+        const modeEl = document.getElementById('statusMode');
+        if (modeEl) modeEl.textContent = (bearState.mode || 'idle').toUpperCase();
+        const autoEl = document.getElementById('statusAutomation');
+        if (autoEl) {
+            autoEl.textContent = bearState.automation ? 'ON' : 'MANUAL';
+            autoEl.style.color = bearState.automation ? 'var(--accent-green)' : 'var(--accent-orange)';
+        }
+        const toggle = document.getElementById('toggleAutomation');
+        if (toggle && document.activeElement !== toggle) toggle.checked = !!bearState.automation;
+
+        const beatEl = document.getElementById('statusBeat');
+        if (beatEl) beatEl.textContent = Math.round(bearState.beat_energy || 0) + '%';
+
+        const hwEl = document.getElementById('statusHardware');
+        if (hwEl) {
+            hwEl.textContent = bearState.hardware_available ? 'GPIO ONLINE' : 'SIMULATION';
+            hwEl.style.color = bearState.hardware_available ? 'var(--accent-green)' : 'var(--accent-orange)';
+        }
+
+        updateMouthUI();
+        updateBodyUI();
+        updateTushieUI();
+
+        const spotEl = document.getElementById('statusSpotlight');
+        if (spotEl) spotEl.textContent = (bearState.spotlight.mode || 'idle').toUpperCase();
+        const stageEl = document.getElementById('statusStage');
+        if (stageEl) stageEl.textContent = (bearState.stage.mode || 'idle').toUpperCase();
+
+        const beatBar = document.getElementById('danceBeatEnergyBar');
+        if (beatBar) beatBar.style.width = Math.min(100, bearState.beat_energy || 0) + '%';
+        const beatVal = document.getElementById('danceBeatEnergyVal');
+        if (beatVal) beatVal.textContent = Math.round(bearState.beat_energy || 0) + '%';
+
+        if (bearState.automation) {
+            setSliderValue('slideSpotPan', bearState.spotlight.pan, '°');
+            setSliderValue('slideSpotTilt', bearState.spotlight.tilt, '°');
+            setSliderValue('slideSpotIntensity', bearState.spotlight.intensity, '%');
+            setSliderValue('slideStageAngle', bearState.stage.angle, '°');
+        }
+    }
+
+    function pollState() {
+        fetch('/api/bear/state')
+            .then((res) => res.json())
+            .then(applyServerState)
+            .catch(() => {});
+    }
+
+    pollState();
+    setInterval(pollState, 350);
+
+    function setupMotorControls(api) {
+        const btnOpen = document.getElementById('btnMouthOpen');
+        const btnClose = document.getElementById('btnMouthClose');
+        const btnMouthStop = document.getElementById('btnMouthStop');
+        const btnBodyLeft = document.getElementById('btnBodyLeft');
+        const btnBodyRight = document.getElementById('btnBodyRight');
+        const btnBodyStop = document.getElementById('btnBodyStop');
+        const btnTushiePop = document.getElementById('btnTushiePop');
+        const btnTushieRelease = document.getElementById('btnTushieRelease');
+
+        if (btnOpen) btnOpen.addEventListener('click', () => api.setMouthMode('open'));
+        if (btnClose) btnClose.addEventListener('click', () => api.setMouthMode('off'));
+        if (btnMouthStop) btnMouthStop.addEventListener('click', () => api.setMouthMode('off'));
+        if (btnBodyLeft) btnBodyLeft.addEventListener('click', () => api.setBody('left'));
+        if (btnBodyRight) btnBodyRight.addEventListener('click', () => api.setBody('right'));
+        if (btnBodyStop) btnBodyStop.addEventListener('click', () => api.setBody('off'));
+        if (btnTushiePop) btnTushiePop.addEventListener('click', () => api.pulseTushie(0.9));
+        if (btnTushieRelease) btnTushieRelease.addEventListener('click', () => api.setTushie(false));
+    }
+
+    function setupSpotlightStageControls(api) {
+        document.querySelectorAll('[data-spot-mode]').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                const mode = btn.dataset.spotMode;
+                if (mode === 'flash') {
+                    api.setMode('dancing');
+                } else if (mode === 'breathe') {
+                    api.setMode('talking');
+                } else if (mode === 'idle') {
+                    api.setMode('idle');
+                } else if (mode === 'solid') {
+                    api.setAutomation(false);
+                    api.setSpotlight({ mode: 'solid', intensity: 100, manual: true });
+                }
+            });
+        });
+
+        document.querySelectorAll('[data-stage-mode]').forEach((btn) => {
+            btn.addEventListener('click', () => {
+                const mode = btn.dataset.stageMode;
+                if (mode === 'dance') {
+                    api.setMode('dancing');
+                } else if (mode === 'talk') {
+                    api.setMode('talking');
+                } else if (mode === 'idle') {
+                    api.setMode('idle');
+                } else if (mode === 'manual') {
+                    api.setAutomation(false);
+                    api.setStage({ angle: bearState.stage.angle, mode: 'manual', manual: true });
+                }
+            });
+        });
+
+        const pan = document.getElementById('slideSpotPan');
+        const tilt = document.getElementById('slideSpotTilt');
+        const intensity = document.getElementById('slideSpotIntensity');
+        const stage = document.getElementById('slideStageAngle');
+
+        const sendSpot = (manual) => {
+            api.setAutomation(false);
+            api.setSpotlight({
+                pan: parseFloat(pan.value),
+                tilt: parseFloat(tilt.value),
+                intensity: parseFloat(intensity.value),
+                mode: 'manual',
+                manual: manual
+            });
+        };
+
+        if (pan) {
+            pan.addEventListener('input', () => {
+                setSliderValue('slideSpotPan', pan.value, '°');
+                sendSpot(false);
+            });
+            pan.addEventListener('change', () => sendSpot(true));
+        }
+        if (tilt) {
+            tilt.addEventListener('input', () => {
+                setSliderValue('slideSpotTilt', tilt.value, '°');
+                sendSpot(false);
+            });
+            tilt.addEventListener('change', () => sendSpot(true));
+        }
+        if (intensity) {
+            intensity.addEventListener('input', () => {
+                setSliderValue('slideSpotIntensity', intensity.value, '%');
+                sendSpot(false);
+            });
+            intensity.addEventListener('change', () => sendSpot(true));
+        }
+        if (stage) {
+            stage.addEventListener('input', () => {
+                setSliderValue('slideStageAngle', stage.value, '°');
+                api.setAutomation(false);
+                api.setStage({ angle: parseFloat(stage.value), mode: 'manual', manual: false });
+            });
+            stage.addEventListener('change', () => {
+                api.setStage({ angle: parseFloat(stage.value), mode: 'manual', manual: true });
+            });
+        }
+
+        const toggle = document.getElementById('toggleAutomation');
+        if (toggle) {
+            toggle.addEventListener('change', () => api.setAutomation(toggle.checked));
+        }
+    }
+
+    function setupPresets(api) {
+        const talk = document.getElementById('btnPresetTalk');
+        const dance = document.getElementById('btnPresetDance');
+        const idle = document.getElementById('btnPresetIdle');
+        const mouth = document.getElementById('btnPresetMouth');
+
+        if (talk) talk.addEventListener('click', () => api.setMode('talking'));
+        if (dance) dance.addEventListener('click', () => {
+            const musicTab = document.getElementById('tabMusicPlayer');
+            if (musicTab) musicTab.click();
+            api.setMode('dancing');
+            if (performanceEngine && performanceEngine.playlist && performanceEngine.playlist.length > 0) {
+                performanceEngine.selectAndPlayTrack(performanceEngine.playlist[0].name);
+            }
+        });
+        if (idle) idle.addEventListener('click', () => api.setMode('idle'));
+        if (mouth) {
+            mouth.addEventListener('click', () => {
+                api.setMode('idle');
+                api.setBody('off');
+                api.setTushie(false);
+                api.setMouthMode('open');
+                setTimeout(() => api.setMouthMode('off'), 700);
+                setTimeout(() => api.setMouthMode('open'), 1100);
+                setTimeout(() => api.setMouthMode('off'), 1700);
+            });
+        }
+    }
+
+    function setupCamera(api) {
+        const select = document.getElementById('selectCamera');
+        const btn = document.getElementById('btnSwitchCamera');
+        if (select && btn) {
+            btn.addEventListener('click', () => {
+                postJSON('/api/camera/select', { source: select.value }).then(() => {
+                    const feed = document.getElementById('camFeed');
+                    if (feed) feed.src = '/api/camera/frame?t=' + Date.now();
+                });
+            });
+        }
+
+        const feed = document.getElementById('camFeed');
+        if (feed) setInterval(() => { feed.src = '/api/camera/frame?t=' + Date.now(); }, 700);
+    }
+
+    function setupExport() {
+        const btn = document.getElementById('btnExportScript');
+        if (!btn) return;
+        btn.addEventListener('click', () => {
+            fetch('/api/export-python', { method: 'POST', body: JSON.stringify({}) })
+                .then((res) => res.blob())
+                .then((blob) => {
+                    const url = window.URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = 'bear_stage_control.py';
+                    document.body.appendChild(link);
+                    link.click();
+                    link.remove();
+                    window.URL.revokeObjectURL(url);
+                });
+        });
+    }
+
+    function setupHardwareSettings(api) {
+        const selectCam = document.getElementById('selectCameraSettings');
+        const selectMic = document.getElementById('selectMicSettings');
+        const selectMicDevice = document.getElementById('selectMicDevice');
+        const selectSpk = document.getElementById('selectSpeakerSettings');
+        const slideMicGain = document.getElementById('slideMicGainSettings');
+        const slideSpkVol = document.getElementById('slideSpeakerVolSettings');
+        const statusEl = document.getElementById('statusHardwareSettings');
+
+        fetch('/api/hardware/config')
+            .then((res) => res.json())
+            .then((data) => {
+                if (selectCam && data.camera_source) selectCam.value = data.camera_source;
+                if (selectMic && data.mic_source) selectMic.value = data.mic_source;
+                if (selectSpk && data.speaker_source) selectSpk.value = data.speaker_source;
+                if (slideMicGain && data.mic_sensitivity !== undefined) {
+                    slideMicGain.value = data.mic_sensitivity;
+                    const el = document.getElementById('valMicGainSettings');
+                    if (el) el.textContent = data.mic_sensitivity + '%';
+                }
+                if (slideSpkVol && data.speaker_volume !== undefined) {
+                    slideSpkVol.value = data.speaker_volume;
+                    const el = document.getElementById('valSpeakerVolSettings');
+                    if (el) el.textContent = data.speaker_volume + '%';
+                    speakerVolume = data.speaker_volume;
+                    const player = document.getElementById('danceAudioPlayer');
+                    if (player) player.volume = speakerVolume / 100;
+                    const mainVol = document.getElementById('volumeAudioSlider');
+                    if (mainVol) mainVol.value = speakerVolume;
+                    const mainVal = document.getElementById('valVolumeText');
+                    if (mainVal) mainVal.textContent = speakerVolume + '%';
+                }
+                if (selectMicDevice && data.mic_device) {
+                    selectMicDevice.dataset.saved = data.mic_device;
+                }
+                if (data.automation !== undefined) {
+                    bearState.automation = !!data.automation;
+                    refreshModeUI();
+                }
+            })
+            .catch(() => {});
+
+        const save = (payload, label) => {
+            postJSON('/api/hardware/config', payload).then(() => {
+                if (statusEl) {
+                    statusEl.textContent = '✅ Saved ' + label;
+                    statusEl.style.color = 'var(--accent-green)';
+                }
+            });
+        };
+
+        const btnSaveCam = document.getElementById('btnSaveCameraSettings');
+        if (btnSaveCam && selectCam) btnSaveCam.addEventListener('click', () => {
+            save({ camera_source: selectCam.value }, 'camera');
+            const main = document.getElementById('selectCamera');
+            if (main) main.value = selectCam.value;
+        });
+
+        const btnSaveMic = document.getElementById('btnSaveMicSettings');
+        if (btnSaveMic) btnSaveMic.addEventListener('click', () => {
+            save({
+                mic_source: selectMic ? selectMic.value : 'browser',
+                mic_device: selectMicDevice ? selectMicDevice.value : '',
+                mic_sensitivity: slideMicGain ? parseInt(slideMicGain.value, 10) : 100,
+                mic_gain: slideMicGain ? parseInt(slideMicGain.value, 10) : 100
+            }, 'microphone');
+            localStorage.setItem('MIC_SENSITIVITY', slideMicGain ? slideMicGain.value : 100);
+            const micSlide = document.getElementById('slideMicSensitivity');
+            if (micSlide && slideMicGain) micSlide.value = slideMicGain.value;
+            const micVal = document.getElementById('valMicSensitivity');
+            if (micVal && slideMicGain) micVal.textContent = slideMicGain.value + '%';
+            if (geminiController) geminiController.setMicDevice(selectMicDevice ? selectMicDevice.value : '');
+        });
+
+        const btnSaveSpk = document.getElementById('btnSaveSpeakerSettings');
+        if (btnSaveSpk && selectSpk) btnSaveSpk.addEventListener('click', () => {
+            const value = selectSpk.value.indexOf('local:') === 0 ? 'default' : 'browser';
+            save({
+                speaker_source: value,
+                speaker_volume: slideSpkVol ? parseInt(slideSpkVol.value, 10) : speakerVolume
+            }, 'speaker');
+            if (slideSpkVol) api.setVolume(slideSpkVol.value);
+        });
+
+        if (slideMicGain) {
+            slideMicGain.addEventListener('input', (e) => {
+                const el = document.getElementById('valMicGainSettings');
+                if (el) el.textContent = e.target.value + '%';
+                const micSlide = document.getElementById('slideMicSensitivity');
+                if (micSlide) micSlide.value = e.target.value;
+                const micVal = document.getElementById('valMicSensitivity');
+                if (micVal) micVal.textContent = e.target.value + '%';
+                localStorage.setItem('MIC_SENSITIVITY', e.target.value);
+            });
+        }
+
+        if (slideSpkVol) {
+            slideSpkVol.addEventListener('input', (e) => {
+                const el = document.getElementById('valSpeakerVolSettings');
+                if (el) el.textContent = e.target.value + '%';
+                api.setVolume(e.target.value);
+            });
+        }
+
+        const refresh = document.getElementById('btnRefreshMics');
+        if (refresh && geminiController) {
+            refresh.addEventListener('click', () => geminiController.populateMicDevices());
+        }
+        if (selectMicDevice && geminiController) {
+            selectMicDevice.addEventListener('change', () => {
+                geminiController.setMicDevice(selectMicDevice.value);
+            });
+        }
+
+        fetch('/api/status')
+            .then((res) => res.json())
+            .then((data) => {
+                const gpio = document.getElementById('gpioStatusText');
+                if (!gpio) return;
+                if (data.hardware_available) {
+                    gpio.innerHTML = '🟢 <b style="color:var(--accent-green)">GPIO online.</b> L298N, IRLZ44N spotlight and all three servos are available on the Raspberry Pi 5.';
+                } else {
+                    gpio.innerHTML = '🟠 <b style="color:var(--accent-orange)">Simulation mode.</b> GPIO is not available: ' +
+                        (data.hardware_error || 'unknown error') +
+                        '. The UI and 3D stage still work, and the exported Python script can be run on the Pi.';
+                }
+                const hwEl = document.getElementById('statusHardware');
+                if (hwEl) {
+                    hwEl.textContent = data.hardware_available ? 'GPIO ONLINE' : 'SIMULATION';
+                    hwEl.style.color = data.hardware_available ? 'var(--accent-green)' : 'var(--accent-orange)';
+                }
+            })
+            .catch(() => {});
+    }
+
+
+    function setupProfileSettings(api, geminiController) {
+        const el = (id) => document.getElementById(id);
+        const nameInput = el('profileNameInput');
+        const personality = el('profilePersonalitySelect');
+        const customWrap = el('profileCustomPersonalityWrap');
+        const customText = el('profileCustomPersonality');
+        const mimicToggle = el('profileMimicToggle');
+        const voice = el('profileVoiceSelect');
+        const speaker = el('profileSpeakerSelect');
+        const volume = el('profileVolumeSlider');
+        const volumeVal = el('profileVolumeVal');
+        const micSource = el('profileMicSource');
+        const micDevice = el('profileMicDevice');
+        const micSensitivity = el('profileMicSensitivity');
+        const micSensitivityVal = el('profileMicSensitivityVal');
+        const camera = el('profileCameraSource');
+        const status = el('statusProfileSave');
+        const btnSave = el('btnSaveProfile');
+        const btnReset = el('btnResetProfile');
+        const btnTest = el('btnTestProfileVoice');
+
+        if (!nameInput || !btnSave) return;
+
+        function setStatus(message, color) {
+            if (!status) return;
+            status.textContent = message;
+            status.style.color = color || 'var(--accent-green)';
+        }
+
+        function syncCustomVisibility() {
+            if (customWrap) customWrap.style.display = personality && personality.value === 'custom' ? 'block' : 'none';
+        }
+
+        function setSelectIfAvailable(id, value) {
+            const select = el(id);
+            if (!select) return;
+            const option = Array.from(select.options).find((item) => item.value === value);
+            if (option) select.value = value;
+        }
+
+        function setSliderLabels() {
+            if (volumeVal) volumeVal.textContent = (volume ? volume.value : 100) + '%';
+            if (micSensitivityVal) micSensitivityVal.textContent = (micSensitivity ? micSensitivity.value : 100) + '%';
+        }
+
+        function applyProfile(profile, announce) {
+            if (!profile) return;
+            const name = profile.name || 'Bruno';
+            nameInput.value = name;
+            if (personality) {
+                personality.value = profile.personality || 'playful';
+                if (!Array.from(personality.options).some((item) => item.value === personality.value)) {
+                    personality.value = 'playful';
+                }
+            }
+            if (customText) customText.value = profile.personality_custom || '';
+            if (mimicToggle) mimicToggle.checked = !!profile.mimic_mode;
+            if (voice) voice.value = profile.voice || 'ai_female_us';
+            if (micSource) micSource.value = profile.mic_source || 'browser';
+            if (camera) camera.value = profile.camera_source || 'usb';
+
+            const sensitivity = parseInt(profile.mic_sensitivity, 10) || 100;
+            if (micSensitivity) micSensitivity.value = sensitivity;
+
+            const speakerSource = profile.speaker_source || 'browser';
+            const target = speakerSource === 'default' ? 'local:default' : 'browser';
+            if (speaker) speaker.value = target;
+
+            const configuredVolume = parseInt(profile.speaker_volume, 10);
+            if (volume) volume.value = isNaN(configuredVolume) ? 100 : configuredVolume;
+            setSliderLabels();
+            syncCustomVisibility();
+
+            if (geminiController) {
+                geminiController.profileName = name;
+                geminiController.micSensitivity = sensitivity;
+                localStorage.setItem('MIC_SENSITIVITY', sensitivity);
+                if (profile.mic_device !== undefined) geminiController.setMicDevice(profile.mic_device || '');
+            }
+
+            const mainVoice = el('selectVoice');
+            if (mainVoice && voice) mainVoice.value = voice.value;
+            const mainCamera = el('selectCamera');
+            if (mainCamera && camera) setSelectIfAvailable('selectCamera', camera.value);
+            setSelectIfAvailable('selectCameraSettings', camera ? camera.value : 'usb');
+            setSelectIfAvailable('selectMicSettings', profile.mic_source || 'browser');
+            setSelectIfAvailable('selectSpeakerSettings', speakerSource);
+            if (micDevice && profile.mic_device !== undefined) micDevice.value = profile.mic_device || '';
+
+            const settingsMic = el('slideMicGainSettings');
+            if (settingsMic) settingsMic.value = sensitivity;
+            const settingsMicVal = el('valMicGainSettings');
+            if (settingsMicVal) settingsMicVal.textContent = sensitivity + '%';
+            const mainMic = el('slideMicSensitivity');
+            if (mainMic) mainMic.value = sensitivity;
+            const mainMicVal = el('valMicSensitivity');
+            if (mainMicVal) mainMicVal.textContent = sensitivity + '%';
+            const settingsVol = el('slideSpeakerVolSettings');
+            if (settingsVol) settingsVol.value = volume ? volume.value : 100;
+
+            if (window.AudioOutputDevices) {
+                if (AudioOutputDevices.setTarget) AudioOutputDevices.setTarget(target);
+                if (AudioOutputDevices.populate) AudioOutputDevices.populate();
+            }
+            if (volume) api.setVolume(volume.value);
+            if (announce) setStatus('✅ Profile saved for ' + name, 'var(--accent-green)');
+        }
+
+        function collectProfile() {
+            const speakerValue = speaker ? speaker.value : 'browser';
+            return {
+                name: nameInput.value.trim() || 'Bruno',
+                personality: personality ? personality.value : 'playful',
+                personality_custom: customText ? customText.value.trim() : '',
+                mimic_mode: !!(mimicToggle && mimicToggle.checked),
+                voice: voice ? voice.value : 'ai_female_us',
+                camera_source: camera ? camera.value : 'usb',
+                mic_source: micSource ? micSource.value : 'browser',
+                mic_device: micDevice ? micDevice.value : '',
+                mic_sensitivity: micSensitivity ? parseInt(micSensitivity.value, 10) : 100,
+                speaker_source: speakerValue.indexOf('local:') === 0 ? 'default' : 'browser',
+                speaker_volume: volume ? parseInt(volume.value, 10) : 100
+            };
+        }
+
+        function saveProfile(profile, announce) {
+            setStatus('⏳ Saving profile...', 'var(--accent-cyan)');
+            postJSON('/api/profile', { profile: profile }).then((data) => {
+                if (data.success) {
+                    applyProfile(data.profile, announce);
+                    if (announce) {
+                        setStatus('✅ Profile saved for ' + (data.profile.name || 'Bruno'), 'var(--accent-green)');
+                    }
+                } else {
+                    setStatus('❌ ' + (data.error || 'Could not save profile'), 'var(--accent-red)');
+                }
+            });
+        }
+
+        function loadProfile() {
+            fetch('/api/profile')
+                .then((res) => res.json())
+                .then((data) => {
+                    if (data.profile) applyProfile(data.profile, false);
+                    if (data.personalities && !customText) {
+                        // The static options mirror the server presets; nothing else needed.
+                    }
+                })
+                .catch(() => setStatus('❌ Could not load profile', 'var(--accent-red)'));
+        }
+
+        if (personality) personality.addEventListener('change', syncCustomVisibility);
+        if (volume) volume.addEventListener('input', () => {
+            setSliderLabels();
+            api.setVolume(volume.value);
+        });
+        if (micSensitivity) micSensitivity.addEventListener('input', () => {
+            setSliderLabels();
+            const value = parseInt(micSensitivity.value, 10);
+            if (geminiController) {
+                geminiController.micSensitivity = value;
+                localStorage.setItem('MIC_SENSITIVITY', value);
+            }
+            const settingsMic = el('slideMicGainSettings');
+            if (settingsMic) settingsMic.value = value;
+            const settingsMicVal = el('valMicGainSettings');
+            if (settingsMicVal) settingsMicVal.textContent = value + '%';
+            const mainMic = el('slideMicSensitivity');
+            if (mainMic) mainMic.value = value;
+            const mainMicVal = el('valMicSensitivity');
+            if (mainMicVal) mainMicVal.textContent = value + '%';
+        });
+        if (micDevice) micDevice.addEventListener('change', () => {
+            if (geminiController) geminiController.setMicDevice(micDevice.value);
+        });
+
+        if (btnSave) btnSave.addEventListener('click', () => saveProfile(collectProfile(), true));
+        if (btnReset) {
+            btnReset.addEventListener('click', () => {
+                if (!confirm('Reset the bear profile to the default playful Bruno settings?')) return;
+                saveProfile({
+                    name: 'Bruno',
+                    personality: 'playful',
+                    personality_custom: '',
+                    mimic_mode: false,
+                    voice: 'ai_female_us',
+                    camera_source: 'usb',
+                    mic_source: 'browser',
+                    mic_device: '',
+                    mic_sensitivity: 100,
+                    speaker_source: 'browser',
+                    speaker_volume: 100
+                }, true);
+            });
+        }
+        if (btnTest) {
+            btnTest.addEventListener('click', () => {
+                if (!geminiController) return;
+                const selectedVoice = voice ? voice.value : 'ai_female_us';
+                const mainVoice = el('selectVoice');
+                if (mainVoice) mainVoice.value = selectedVoice;
+                const bearName = nameInput.value.trim() || 'Bruno';
+                geminiController.speak('Hi, I am ' + bearName + '. Welcome to the show!');
+            });
+        }
+
+        const profileTab = document.querySelector('[data-view="viewProfile"]');
+        if (profileTab) profileTab.addEventListener('click', loadProfile);
+
+        loadProfile();
+    }
+
+    function setupTopNavTabs() {
+        const navButtons = document.querySelectorAll('.nav-tab-btn');
+        const viewScreens = document.querySelectorAll('.view-screen');
+        navButtons.forEach((btn) => {
+            btn.addEventListener('click', () => {
+                navButtons.forEach((b) => b.classList.remove('active'));
+                viewScreens.forEach((s) => s.classList.remove('active'));
+                btn.classList.add('active');
+                const target = document.getElementById(btn.dataset.view);
+                if (target) target.classList.add('active');
+            });
+        });
+    }
+
+    function setupRightPanelTabs() {
+        const tabGemini = document.getElementById('tabGeminiAI');
+        const tabMusic = document.getElementById('tabMusicPlayer');
+        const sectionGemini = document.getElementById('sectionGeminiAI');
+        const sectionMusic = document.getElementById('sectionMusicPlayer');
+
+        if (tabGemini && tabMusic && sectionGemini && sectionMusic) {
+            tabGemini.addEventListener('click', () => {
+                tabGemini.classList.add('active');
+                tabMusic.classList.remove('active');
+                sectionGemini.style.display = 'block';
+                sectionMusic.style.display = 'none';
+            });
+            tabMusic.addEventListener('click', () => {
+                tabMusic.classList.add('active');
+                tabGemini.classList.remove('active');
+                sectionMusic.style.display = 'block';
+                sectionGemini.style.display = 'none';
+            });
+        }
+    }
+
+    const resetCam = document.getElementById('btnResetCam');
+    if (resetCam && renderer && renderer.camera) {
+        resetCam.addEventListener('click', () => {
+            renderer.camera.position.set(0, 170, 470);
+            renderer.controls.target.set(0, 100, 0);
+        });
+    }
+
+    api_setVolumeInitial();
+    function api_setVolumeInitial() {
+        const slider = document.getElementById('volumeAudioSlider');
+        if (slider) {
+            slider.addEventListener('input', (e) => appAPI.setVolume(e.target.value));
+            appAPI.setVolume(slider.value || 100);
+        }
+    }
+});
